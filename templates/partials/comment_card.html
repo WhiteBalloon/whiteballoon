@@ -1,7 +1,18 @@
 {% set variant = variant or 'request' %}
 {% set display_name = comment.display_name or '' %}
+{% set promotion_target = comment_promotion | default(none) %}
+{% set promotion_count = comment_promotion_count | default(0) %}
+{% set comment_permalink_href = comment_permalink_href | default('') %}
 {% if variant == 'request' %}
-<li class="request-comment" data-comment-id="{{ comment.id }}" id="comment-{{ comment.id }}">
+<li
+  class="request-comment"
+  data-comment-id="{{ comment.id }}"
+  data-comment-username="{{ comment.username }}"
+  data-comment-display-name="{{ display_name }}"
+  {% if promotion_target %}data-comment-promoted-request="{{ promotion_target.request_id }}"{% endif %}
+  {% if promotion_count %}data-comment-promotion-count="{{ promotion_count }}"{% endif %}
+  id="comment-{{ comment.id }}"
+>
   <div class="request-comment__meta">
     {% if display_name %}
       <a class="request-comment__author" href="/people/{{ comment.username }}" title="@{{ comment.username }}">{{ display_name }}</a>
@@ -14,7 +25,13 @@
         <button class="meta-chip meta-chip--small comment-insight-badge" data-comment-insight-id="{{ comment.id }}">Insights</button>
       {% endif %}
       {% if comment.created_at %}
-        <time datetime="{{ comment.created_at_iso }}" class="request-comment__time">{{ comment.created_at | friendly_time }}</time>
+        {% if comment_permalink_href %}
+          <a class="request-comment__time-link" href="{{ comment_permalink_href }}">
+            <time datetime="{{ comment.created_at_iso }}" class="request-comment__time">{{ comment.created_at | friendly_time }}</time>
+          </a>
+        {% else %}
+          <time datetime="{{ comment.created_at_iso }}" class="request-comment__time">{{ comment.created_at | friendly_time }}</time>
+        {% endif %}
       {% endif %}
       {% if actions %}
         {% for action in actions %}
@@ -23,7 +40,23 @@
       {% endif %}
     </div>
   </div>
-  <p class="request-comment__body">{{ comment.body }}</p>
+  <p class="request-comment__body" data-comment-body-text>{{ comment.body }}</p>
+  {% if promotion_target %}
+    <div class="request-comment__promotion">
+      <span class="meta-chip meta-chip--small meta-chip--ghost">
+        Promoted to <a href="/requests/{{ promotion_target.request_id }}">request #{{ promotion_target.request_id }}</a>
+        {% if promotion_count > 1 %}({{ promotion_count }} times){% endif %}
+      </span>
+    </div>
+  {% endif %}
+  {% if comment_request_context %}
+    <div class="request-comment__context">
+      <a class="request-comment__context-link" href="{{ comment_request_context.href }}">{{ comment_request_context.label }}</a>
+      {% if comment_request_context.title %}
+        <p class="muted small-text">{{ comment_request_context.title }}</p>
+      {% endif %}
+    </div>
+  {% endif %}
   {% if comment_insights_enabled %}
     <div class="comment-insight-detail" id="comment-insight-detail-{{ comment.id }}"></div>
   {% endif %}

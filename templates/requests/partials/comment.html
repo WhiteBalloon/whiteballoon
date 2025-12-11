@@ -1,12 +1,27 @@
 {% set comment_actions = [] %}
 {% set comment_insights_enabled = comment_insights_enabled | default(false) %}
 {% set comment_insights_map = comment_insights_map | default({}) %}
+{% set can_promote_comments = can_promote_comments | default(false) %}
+{% set comment_promotions = comment_promotions | default({}) %}
+{% set comment_promotion_entries = comment_promotions.get(comment.id) or [] %}
+{% set comment_latest_promotion = comment_promotion_entries[-1] if comment_promotion_entries else none %}
 {% if can_toggle_sync_scope %}
   {% set _ = comment_actions.append('<form method="post" action="/sync/scope" data-comment-scope-form><input type="hidden" name="entity_type" value="comment" /><input type="hidden" name="entity_id" value="' ~ comment.id ~ '" /><input type="hidden" name="next" value="' ~ request.url.path ~ '" /><input type="hidden" name="scope" value="' ~ ('public' if comment.sync_scope == 'private' else 'private') ~ '" /><button type="submit" class="button button--ghost request-comment__delete">' ~ ('Share' if comment.sync_scope == 'private' else 'Make private') ~ '</button></form>') %}
 {% endif %}
 {% if can_moderate_comments %}
   {% set _ = comment_actions.append('<form method="post" action="/requests/' ~ request_id ~ '/comments/' ~ comment.id ~ '/delete" data-comment-delete-form><button type="submit" class="button button--ghost request-comment__delete" data-comment-delete>Delete</button></form>') %}
 {% endif %}
-{% with actions = comment_actions, variant = 'request', comment_insights_enabled = comment_insights_enabled, comment_insights_map = comment_insights_map %}
+{% if can_promote_comments %}
+  {% set promote_btn %}
+    <button
+      type="button"
+      class="button button--ghost request-comment__promote"
+      data-comment-promote
+      data-comment-promote-id="{{ comment.id }}"
+    >Promote</button>
+  {% endset %}
+  {% set _ = comment_actions.append(promote_btn) %}
+{% endif %}
+{% with actions = comment_actions, variant = 'request', comment_insights_enabled = comment_insights_enabled, comment_insights_map = comment_insights_map, comment_promotion = comment_latest_promotion, comment_promotion_count = comment_promotion_entries | length, comment_permalink_href = '/comments/' ~ comment.id %}
   {% include "partials/comment_card.html" %}
 {% endwith %}

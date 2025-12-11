@@ -1,0 +1,62 @@
+{% set filter_options = filter_options | default({}) %}
+{% set active_filters = active_filters | default({}) %}
+{% set reset_url = filter_reset_url | default(request.url.path) %}
+<div class="request-filter" data-request-filter>
+  <div class="request-filter__header">
+    <h2>Filter requests</h2>
+    <a href="{{ reset_url }}" class="button button--ghost button--small">Reset</a>
+  </div>
+  <div class="request-filter__sections">
+    {% if filter_options.topics %}
+      <section class="filter-section">
+        <h3 class="filter-section__title">Topics</h3>
+        <div class="filter-chip-group" role="group" aria-label="Filter by topic">
+          {% for option in filter_options.topics %}
+            <a
+              href="{{ option.url }}"
+              class="filter-chip{% if option.active %} filter-chip--active{% endif %}"
+              aria-pressed="{{ 'true' if option.active else 'false' }}"
+            >
+              {{ option.label }}
+              {% if option.count %}
+                <span class="filter-chip__count">{{ option.count }}</span>
+              {% endif %}
+            </a>
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+    {% if filter_options.urgency %}
+      <section class="filter-section">
+        <h3 class="filter-section__title">Urgency</h3>
+        <div class="filter-chip-group" role="group" aria-label="Filter by urgency">
+          {% for option in filter_options.urgency %}
+            <a
+              href="{{ option.url }}"
+              class="filter-chip{% if option.active %} filter-chip--active{% endif %}"
+              aria-pressed="{{ 'true' if option.active else 'false' }}"
+            >
+              {{ option.label }}
+            </a>
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+    {% if filter_options.status %}
+      <section class="filter-section">
+        <h3 class="filter-section__title">Status</h3>
+        <div class="filter-chip-group" role="group" aria-label="Filter by status">
+          {% for option in filter_options.status %}
+            <a
+              href="{{ option.url }}"
+              class="filter-chip{% if option.active %} filter-chip--active{% endif %}"
+              aria-pressed="{{ 'true' if option.active else 'false' }}"
+            >
+              {{ option.label }}
+            </a>
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+  </div>
+</div>

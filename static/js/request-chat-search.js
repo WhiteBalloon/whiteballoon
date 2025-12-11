@@ -10,8 +10,24 @@
   const statusEl = container.querySelector('[data-chat-search-status]');
   const template = document.querySelector('#chat-search-result-template');
   const requestId = container.getAttribute('data-request-id');
+  const panel = container.querySelector('[data-chat-search-panel]');
+  const toggle = container.querySelector('[data-chat-search-toggle]');
   if (!form || !input || !resultsList || !template || !requestId) {
     return;
+  }
+
+  if (panel && toggle) {
+    const setCollapsed = (collapsed) => {
+      panel.hidden = collapsed;
+      toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      toggle.textContent = collapsed ? 'Show' : 'Hide';
+      container.classList.toggle('request-chat-search--collapsed', collapsed);
+    };
+
+    setCollapsed(true);
+    toggle.addEventListener('click', () => {
+      setCollapsed(!panel.hidden);
+    });
   }
 
   let debounceTimer;

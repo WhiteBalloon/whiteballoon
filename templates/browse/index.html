@@ -1,0 +1,262 @@
+{% extends "base.html" %}
+
+{% block title %}Browse · WhiteBalloon{% endblock %}
+
+{% block nav %}
+  {% include "partials/account_nav.html" %}
+{% endblock %}
+
+{% block content %}
+<section class="section stack" data-page="browse">
+  <header class="stack browse-header">
+    <p class="muted small-text">Unified content browser</p>
+    <h1>Browse</h1>
+    <p class="muted">Search requests, comments, and member profiles without leaving this page.</p>
+  </header>
+
+  <div class="browse-grid">
+    <form method="get" class="card browse-filter">
+      <input type="hidden" name="page" value="1" />
+      {% if active_tab != 'all' %}
+        <input type="hidden" name="type" value="{{ active_tab }}" />
+      {% endif %}
+      <label class="stack" for="browse-query">
+        <span>Keyword</span>
+        <input
+          id="browse-query"
+          type="text"
+          name="q"
+          value="{{ search_query }}"
+          placeholder="Search descriptions, comments, or usernames"
+        />
+      </label>
+      <fieldset class="browse-filter__fieldset">
+        <legend>Status</legend>
+        <div class="browse-filter__options">
+          {% for option in status_options %}
+            <label class="chip-input">
+              <input type="checkbox" name="status" value="{{ option.slug }}"{% if option.active %} checked{% endif %} />
+              <span>{{ option.label }}</span>
+            </label>
+          {% endfor %}
+        </div>
+      </fieldset>
+      <fieldset class="browse-filter__fieldset">
+        <legend>Tags</legend>
+        <div class="browse-filter__options">
+          {% for option in tag_options %}
+            <label class="chip-input">
+              <input type="checkbox" name="tag" value="{{ option.slug }}"{% if option.active %} checked{% endif %} />
+              <span>{{ option.label }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <p class="muted small-text">Tags use simple keyword matches across requests and comments.</p>
+      </fieldset>
+      <div class="browse-filter__actions">
+        <button type="submit" class="button button--secondary">Apply filters</button>
+        {% if has_filters %}
+          <a class="button button--ghost" href="{{ filter_reset_url }}">Reset</a>
+        {% endif %}
+      </div>
+    </form>
+
+    <div class="card browse-results">
+      <nav class="browse-tabs" role="tablist">
+        {% for tab in tabs %}
+          <a
+            class="browse-tab{% if tab.active %} is-active{% endif %}"
+            href="{{ tab.url }}"
+            role="tab"
+            aria-selected="{{ 'true' if tab.active else 'false' }}"
+          >
+            <span class="browse-tab__label">{{ tab.label }}</span>
+            <span class="browse-tab__count">{{ tab.count }}</span>
+          </a>
+        {% endfor %}
+      </nav>
+
+      <div class="browse-panel stack">
+        {% if active_tab == 'all' %}
+          {% if combined_page['items'] %}
+            <ul class="browse-feed stack">
+              {% for entry in combined_page['items'] %}
+                <li class="browse-card browse-card--{{ entry.kind }}">
+                  <header class="browse-card__header">
+                    <span class="browse-card__badge">
+                      {% if entry.kind == 'request' %}Request{% elif entry.kind == 'comment' %}Comment{% else %}Profile{% endif %}
+                    </span>
+                    {% if entry.created_at %}
+                      <time datetime="{{ entry.created_at }}" class="browse-card__time">{{ entry.created_at | friendly_time }}</time>
+                    {% endif %}
+                  </header>
+                  <div class="browse-card__body">
+                    {% if entry.kind == 'request' %}
+                      <p>{{ entry.snippet or 'No additional details.' }}</p>
+                    {% elif entry.kind == 'comment' %}
+                      <p>{{ entry.snippet or 'Comment pending.' }}</p>
+                    {% else %}
+                      <div class="browse-card__identity">
+                        <span class="browse-card__avatar" aria-hidden="true">
+                          {% if entry.avatar_url %}
+                            <img src="{{ entry.avatar_url }}" alt="" />
+                          {% else %}
+                            <span class="browse-card__avatar-initials">{{ entry.user.username[:2] | upper }}</span>
+                          {% endif %}
+                        </span>
+                        <div>
+                          <p class="browse-card__username">@{{ entry.user.username }}</p>
+                          <p class="muted small-text">Joined {{ entry.user.created_at | friendly_time }}</p>
+                        </div>
+                      </div>
+                    {% endif %}
+                  </div>
+                  <footer class="browse-card__meta">
+                    {% if entry.kind == 'request' %}
+                      <span class="meta-chip meta-chip--status">{{ entry.data.status | title }}</span>
+                      {% if entry.data.created_by_username %}
+                        <span class="meta-chip">@{{ entry.data.created_by_username }}</span>
+                      {% endif %}
+                      {% if entry.topics %}
+                        <div class="browse-card__tags">
+                          {% for slug in entry.topics %}
+                            {% set topic = topic_lookup.get(slug) %}
+                            {% if topic %}<span class="meta-chip meta-chip--small">{{ topic.label }}</span>{% endif %}
+                          {% endfor %}
+                        </div>
+                      {% endif %}
+                      <a class="button button--ghost" href="{{ entry.href }}">View request</a>
+                    {% elif entry.kind == 'comment' %}
+                      <p class="muted small-text">
+                        @{{ entry.data.username }} on Request #{{ entry.request.id }}
+                      </p>
+                      <a class="button button--ghost" href="{{ entry.href }}">Open conversation</a>
+                    {% else %}
+                      <span class="meta-chip">{{ 'Public' if entry.user.sync_scope == 'public' else 'Private' }} profile</span>
+                      <a class="button button--ghost" href="{{ entry.href }}">View profile</a>
+                    {% endif %}
+                  </footer>
+                </li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p class="muted">No content matches these filters yet.</p>
+          {% endif %}
+        {% elif active_tab == 'requests' %}
+          {% if requests_page['items'] %}
+            <div class="stack">
+              {% for item in requests_page['items'] %}
+                <article class="browse-request">
+                  {% with item = item, readonly = True, show_detail_link = True %}
+                    {% include "requests/partials/item.html" %}
+                  {% endwith %}
+                  {% set badges = requests_page.topics.get(item.id) %}
+                  {% if badges %}
+                    <div class="browse-request__tags">
+                      {% for slug in badges %}
+                        {% set topic = topic_lookup.get(slug) %}
+                        {% if topic %}
+                          <span class="meta-chip meta-chip--small">{{ topic.label }}</span>
+                        {% endif %}
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="muted">No requests match these filters.</p>
+          {% endif %}
+        {% elif active_tab == 'comments' %}
+          {% if comments_page['items'] %}
+            <ul class="request-comments stack">
+              {% for entry in comments_page['items'] %}
+                {% set comment_request_context = {
+                  'label': 'Request #' ~ entry.request.id,
+                  'title': entry.request.title,
+                  'href': '/requests/' ~ entry.request.id
+                } %}
+                {% with comment = entry.comment, comment_request_context = comment_request_context, comment_permalink_href = '/comments/' ~ entry.comment.id %}
+                  {% include "partials/comment_card.html" %}
+                {% endwith %}
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p class="muted">No comments found for this search.</p>
+          {% endif %}
+        {% elif active_tab == 'profiles' %}
+          {% if profiles_page['items'] %}
+            <div class="members-grid">
+              {% for profile in profiles_page['items'] %}
+                {% set scope_is_public = profile.sync_scope == 'public' %}
+                {% if user.is_admin %}
+                  {% set profile_href = '/admin/profiles/' ~ profile.id %}
+                {% elif profile.id == user.id %}
+                  {% set profile_href = '/profile' %}
+                {% else %}
+                  {% set profile_href = '/people/' ~ profile.username %}
+                {% endif %}
+                {% set avatar_url = profiles_page.avatars.get(profile.id) %}
+                <article class="member-card">
+                  <header class="member-card__header">
+                    <div class="member-card__identity">
+                      <span class="member-card__avatar" aria-hidden="true">
+                        {% if avatar_url %}
+                          <img src="{{ avatar_url }}" alt="" />
+                        {% else %}
+                          <span class="member-card__avatar-initials">{{ profile.username[:2] | upper }}</span>
+                        {% endif %}
+                      </span>
+                      <div class="member-card__identity-text">
+                        <p class="member-card__username">@{{ profile.username }}</p>
+                        <p class="muted small-text">Joined {{ profile.created_at | friendly_time }}</p>
+                      </div>
+                    </div>
+                    <span class="meta-chip meta-chip--status meta-chip--{{ 'success' if scope_is_public else 'muted' }}">
+                      <span class="meta-chip__label">Sharing</span>
+                      <span class="meta-chip__value">{{ 'Public' if scope_is_public else 'Private' }}</span>
+                    </span>
+                  </header>
+                  <div class="member-card__body stack">
+                    <div class="member-card__contact">
+                      {% if profile.contact_email and (user.is_admin or scope_is_public) %}
+                        <a href="mailto:{{ profile.contact_email }}" class="meta-chip meta-chip--action">
+                          <span class="meta-chip__label">Contact</span>
+                          <span class="meta-chip__value">{{ profile.contact_email }}</span>
+                        </a>
+                      {% else %}
+                        <p class="muted">Contact hidden</p>
+                      {% endif %}
+                    </div>
+                    <div class="member-card__actions">
+                      <a class="button button--ghost" href="{{ profile_href }}">View profile</a>
+                    </div>
+                  </div>
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="muted">No profiles match these filters.</p>
+          {% endif %}
+        {% endif %}
+      </div>
+
+      <div class="browse-pagination">
+        <p class="muted small-text">Page {{ pagination.current }} of {{ pagination.total }}</p>
+        <div class="browse-pagination__actions">
+          {% if pagination.has_prev %}
+            <a class="button button--ghost" href="{{ pagination.prev_url }}">Previous</a>
+          {% else %}
+            <span class="button button--ghost button--disabled" aria-disabled="true">Previous</span>
+          {% endif %}
+          {% if pagination.has_next %}
+            <a class="button button--ghost" href="{{ pagination.next_url }}">Next</a>
+          {% else %}
+            <span class="button button--ghost button--disabled" aria-disabled="true">Next</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+{% endblock %}

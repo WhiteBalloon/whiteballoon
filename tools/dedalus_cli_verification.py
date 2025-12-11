@@ -43,6 +43,10 @@ WB_SCRIPT = REPO_ROOT / "wb.py"
 # Global knobs tweaked by CLI args so the tool reflects the requested scope.
 TOOL_DEFAULT_LIMIT = 5
 TOOL_INCLUDE_PROCESSED = False
+PROMOTE_DEFAULT_DESCRIPTION: str | None = None
+PROMOTE_DEFAULT_CONTACT: str | None = None
+PROMOTE_DEFAULT_STATUS: str = "open"
+PROMOTE_DEFAULT_FORCE: bool = False
 
 
 def log(message: str) -> None:
@@ -97,15 +101,54 @@ def audit_auth_requests(limit: Optional[int] = None, include_processed: Optional
     return _run_wb_command(wb_args)
 
 
-def _build_prompt(limit: int, include_processed: bool) -> str:
+def promote_comment_to_request(
+    comment_id: int,
+    actor_username: Optional[str] = None,
+    description: Optional[str] = None,
+    status: Optional[str] = None,
+    contact_email: Optional[str] = None,
+    force: Optional[bool] = None,
+) -> str:
+    args = [
+        "promote-comment",
+        "--comment-id",
+        str(comment_id),
+    ]
+    summary = description or PROMOTE_DEFAULT_DESCRIPTION
+    contact = contact_email or PROMOTE_DEFAULT_CONTACT
+    status_value = status or PROMOTE_DEFAULT_STATUS
+    effective_force = PROMOTE_DEFAULT_FORCE if force is None else force
+    if actor_username:
+        args.extend(["--actor", actor_username])
+    if summary:
+        args.extend(["--description", summary])
+    if contact:
+        args.extend(["--contact-email", contact])
+    if status_value:
+        args.extend(["--status", status_value])
+    if effective_force:
+        args.append("--force")
+    args.extend(["--source", "mcp"])
+    return _run_wb_command(args)
+
+
+def _build_prompt(limit: int, include_processed: bool, promote_comment_id: Optional[int], promote_actor: Optional[str]) -> str:
     scope = "pending authentication requests only"
     if include_processed:
         scope = "all authentication requests, including processed ones"
-    return (
-        "Use the `audit_auth_requests` tool to run the real WhiteBalloon CLI. "
-        f"Capture {scope} with a limit of {limit} rows, then summarize what you see. "
-        "Provide two sections in your final response: a bullet summary and the CLI output inside a fenced code block tagged as text."
-    )
+    prompt = (
+        "Use the available tools to triage WhiteBalloon operations. "
+        "First, run `audit_auth_requests` to execute the real CLI against {scope} with a limit of {limit} rows. "
+        "Summarize notable findings, then include the raw CLI output inside a fenced text code block."
+    ).format(scope=scope, limit=limit)
+    if promote_comment_id:
+        prompt += (
+            " After auditing, call `promote_comment_to_request` with comment_id={comment_id}"
+        ).format(comment_id=promote_comment_id)
+        if promote_actor:
+            prompt += " and actor_username='{actor}'".format(actor=promote_actor)
+        prompt += ". Include any helpful summary/contact overrides if needed."
+    return prompt
 
 
 def _parse_args() -> argparse.Namespace:
@@ -128,6 +171,37 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Override the default instructions sent to Dedalus (advanced)",
     )
+    parser.add_argument(
+        "--promote-comment-id",
+        type=int,
+        default=None,
+        help="If provided, instructs the agent to promote this comment via the MCP tool",
+    )
+    parser.add_argument(
+        "--promote-actor",
+        default=None,
+        help="Username that should be passed to the promote tool (required if promoting)",
+    )
+    parser.add_argument(
+        "--promote-description",
+        default=None,
+        help="Optional summary override suggestion for the promote tool",
+    )
+    parser.add_argument(
+        "--promote-status",
+        default="open",
+        help="Default status suggestion for the promote tool",
+    )
+    parser.add_argument(
+        "--promote-contact-email",
+        default=None,
+        help="Optional contact email suggestion for the promote tool",
+    )
+    parser.add_argument(
+        "--promote-force",
+        action="store_true",
+        help="Allow the agent to bypass duplicate checks when promoting",
+    )
     return parser.parse_args()
 
 
@@ -146,7 +220,18 @@ async def run(args: argparse.Namespace) -> int:
         f"Configured tool scope → limit={TOOL_DEFAULT_LIMIT}, include_processed={TOOL_INCLUDE_PROCESSED}"
     )
 
-    instructions = args.prompt or _build_prompt(TOOL_DEFAULT_LIMIT, TOOL_INCLUDE_PROCESSED)
+    global PROMOTE_DEFAULT_DESCRIPTION, PROMOTE_DEFAULT_CONTACT, PROMOTE_DEFAULT_STATUS, PROMOTE_DEFAULT_FORCE
+    PROMOTE_DEFAULT_DESCRIPTION = args.promote_description
+    PROMOTE_DEFAULT_CONTACT = args.promote_contact_email
+    PROMOTE_DEFAULT_STATUS = args.promote_status or "open"
+    PROMOTE_DEFAULT_FORCE = args.promote_force
+
+    instructions = args.prompt or _build_prompt(
+        TOOL_DEFAULT_LIMIT,
+        TOOL_INCLUDE_PROCESSED,
+        args.promote_comment_id,
+        args.promote_actor,
+    )
     model = args.model or os.getenv("DEDALUS_POC_MODEL") or "openai/gpt-5-mini"
     log(f"Using Dedalus model: {model}")
 
@@ -165,10 +250,13 @@ async def run(args: argparse.Namespace) -> int:
 
     log("Starting Dedalus runner invocation")
     try:
+        toolset = [audit_auth_requests]
+        if args.promote_comment_id and args.promote_actor:
+            toolset.append(promote_comment_to_request)
         response = await runner.run(
             input=instructions,
             model=model,
-            tools=instrument_tools([audit_auth_requests], run_id=run_id),
+            tools=instrument_tools(toolset, run_id=run_id),
         )
     except Exception as exc:  # pragma: no cover - external dependency
         finalize_logged_run(run_id=run_id, response=None, status="error", error=str(exc))

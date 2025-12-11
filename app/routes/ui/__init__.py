@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 
 from fastapi import (
@@ -20,6 +22,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import JSONResponse, RedirectResponse
+from sqlalchemy import and_, desc, func, literal, or_, union_all
 from sqlmodel import Session, select
 
 from app.dependencies import (
@@ -29,12 +32,21 @@ from app.dependencies import (
     require_authenticated_user,
     require_session_user,
 )
-from app.models import AuthenticationRequest, HelpRequest, RequestComment, User, UserAttribute, UserSession
+from app.models import (
+    AuthenticationRequest,
+    CommentPromotion,
+    HelpRequest,
+    RequestComment,
+    User,
+    UserAttribute,
+    UserSession,
+)
 from app.modules.requests import services as request_services
 from app.modules.requests.routes import RequestResponse, calculate_can_complete
 from app.services import (
     auth_service,
     comment_llm_insights_service,
+    comment_request_promotion_service,
     invite_graph_service,
     invite_map_cache_service,
     request_chat_search_service,
@@ -52,6 +64,209 @@ from .helpers import describe_session_role, templates
 router = APIRouter(tags=["ui"])
 
 logger = logging.getLogger(__name__)
+
+CHAT_SEARCH_MIN_COMMENTS = 5
+
+FILTER_TOPICS = [
+    {"slug": "groceries", "label": "Groceries", "keywords": ["grocery", "groceries", "food", "meal", "produce"]},
+    {"slug": "rides", "label": "Transportation", "keywords": ["ride", "carpool", "transport", "drive", "pickup"]},
+    {"slug": "housing", "label": "Housing", "keywords": ["room", "housing", "shelter", "rent"]},
+    {"slug": "health", "label": "Health", "keywords": ["medical", "health", "doctor", "medicine"]},
+    {"slug": "childcare", "label": "Childcare", "keywords": ["child", "kid", "babysit", "school"]},
+]
+
+FILTER_TOPICS_LOOKUP = {topic["slug"]: topic for topic in FILTER_TOPICS}
+
+URGENCY_LEVELS = [
+    {"slug": "urgent", "label": "Urgent", "keywords": ["urgent", "asap", "immediately", "tonight", "today"]},
+    {"slug": "soon", "label": "Soon", "keywords": ["tomorrow", "this week", "next few", "soon"]},
+    {"slug": "flexible", "label": "Flexible", "keywords": []},
+]
+
+STATUS_OPTIONS = [
+    {"slug": "open", "label": "Open"},
+    {"slug": "completed", "label": "Completed"},
+]
+
+STATUS_LOOKUP = {status_option["slug"]: status_option for status_option in STATUS_OPTIONS}
+
+BROWSE_PAGE_SIZE = 12
+BROWSE_ALLOWED_TYPES = {"all", "requests", "comments", "profiles"}
+BROWSE_TABS = [
+    {"slug": "all", "label": "Everything"},
+    {"slug": "requests", "label": "Requests"},
+    {"slug": "comments", "label": "Comments"},
+    {"slug": "profiles", "label": "Profiles"},
+]
+
+
+def _normalize_filter_values(values: list[str]) -> set[str]:
+    return {value.strip().lower() for value in values if value and value.strip()}
+
+
+def _infer_request_topics(help_request: HelpRequest) -> set[str]:
+    description = (help_request.description or "").lower()
+    topics: set[str] = set()
+    for topic in FILTER_TOPICS:
+        if any(keyword in description for keyword in topic["keywords"]):
+            topics.add(topic["slug"])
+    return topics
+
+
+def _infer_request_urgency(help_request: HelpRequest) -> str:
+    description = (help_request.description or "").lower()
+    for level in URGENCY_LEVELS:
+        if level["keywords"] and any(keyword in description for keyword in level["keywords"]):
+            return level["slug"]
+    return "flexible"
+
+
+def _matches_request_filters(
+    topics: set[str],
+    urgency: str,
+    status_value: str,
+    topic_filters: set[str],
+    urgency_filters: set[str],
+    status_filters: set[str],
+) -> bool:
+    if topic_filters and topics.isdisjoint(topic_filters):
+        return False
+    if urgency_filters and urgency not in urgency_filters:
+        return False
+    if status_filters and status_value not in status_filters:
+        return False
+    return True
+
+
+def _build_filter_url(
+    base_path: str,
+    current_items: list[tuple[str, str]],
+    field: str,
+    value: str,
+    active: bool,
+) -> str:
+    preserved = [
+        (key, val) for key, val in current_items if not (key == field and val.lower() == value.lower())
+    ]
+    preserved = [(k, v) for (k, v) in preserved if k != "page"]
+    if not active:
+        preserved.append((field, value))
+    query = urlencode(preserved, doseq=True)
+    return f"{base_path}?{query}" if query else base_path
+
+
+def _build_reset_url(base_path: str, current_items: list[tuple[str, str]]) -> str:
+    filtered = [
+        (key, val)
+        for key, val in current_items
+        if key not in {"topic", "urgency", "status", "page"}
+    ]
+    query = urlencode(filtered, doseq=True)
+    return f"{base_path}?{query}" if query else base_path
+
+
+def _normalize_search_term(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _sanitize_browse_tab(value: Optional[str]) -> str:
+    if not value:
+        return "all"
+    value = value.strip().lower()
+    return value if value in BROWSE_ALLOWED_TYPES else "all"
+
+
+def _topic_keyword_clause(columns: list, tag_filters: set[str]):  # noqa: ANN001
+    if not tag_filters:
+        return None
+    keywords: list[str] = []
+    for slug in tag_filters:
+        topic = FILTER_TOPICS_LOOKUP.get(slug)
+        if not topic:
+            continue
+        keywords.extend(topic.get("keywords", []))
+    if not keywords:
+        return None
+    clauses = []
+    for column in columns:
+        for keyword in keywords:
+            clauses.append(column.ilike(f"%{keyword}%"))
+    if not clauses:
+        return None
+    return or_(*clauses)
+
+
+def _profile_visibility_clause(db: Session, viewer: User):  # noqa: ANN001
+    if viewer.is_admin:
+        return None
+
+    invitee_ids = user_attribute_service.list_invitee_user_ids(
+        db,
+        inviter_user_id=viewer.id,
+    )
+    allowed_ids = {user_id for user_id in invitee_ids if user_id}
+    if viewer.id:
+        allowed_ids.add(viewer.id)
+
+    if not allowed_ids:
+        return User.sync_scope == "public"
+
+    return or_(User.sync_scope == "public", User.id.in_(list(allowed_ids)))
+
+
+def _build_browse_tab_url(request: Request, tab_slug: str) -> str:
+    current_items = list(request.query_params.multi_items()) if hasattr(request.query_params, "multi_items") else list(request.query_params.items())
+    filtered = [(key, value) for key, value in current_items if key != "type"]
+    if tab_slug != "all":
+        filtered.append(("type", tab_slug))
+    query = urlencode(filtered, doseq=True)
+    return f"{request.url.path}?{query}" if query else request.url.path
+
+
+def _build_browse_tabs(request: Request, tab_counts: dict[str, int], active_tab: str) -> list[dict[str, object]]:
+    tabs: list[dict[str, object]] = []
+    for tab in BROWSE_TABS:
+        slug = tab["slug"]
+        tabs.append(
+            {
+                "slug": slug,
+                "label": tab["label"],
+                "count": tab_counts.get(slug, 0),
+                "url": _build_browse_tab_url(request, slug),
+                "active": slug == active_tab,
+            }
+        )
+    return tabs
+
+
+def _build_pagination_metadata(request: Request, current_page: int, total_pages: int) -> dict[str, object]:
+    total_pages = max(1, total_pages)
+
+    def _page_url(target_page: int) -> Optional[str]:
+        if target_page < 1 or target_page > total_pages:
+            return None
+        url = request.url.include_query_params(page=target_page)
+        return str(url)
+
+    return {
+        "current": current_page,
+        "total": total_pages,
+        "has_prev": current_page > 1,
+        "has_next": current_page < total_pages,
+        "prev_url": _page_url(current_page - 1) if current_page > 1 else None,
+        "next_url": _page_url(current_page + 1) if current_page < total_pages else None,
+    }
+
+
+def _truncate_text(text: str, limit: int = 220) -> str:
+    snippet = (text or "").strip()
+    if len(snippet) <= limit:
+        return snippet
+    trimmed = snippet[: max(0, limit - 3)].rstrip()
+    return f"{trimmed}..."
 
 
 def _serialize_requests(db: Session, items, viewer: Optional[User] = None):
@@ -196,7 +411,83 @@ def home(
         return templates.TemplateResponse("requests/pending.html", context)
 
     session_avatar_url = _get_account_avatar(db, user.id)
-    public_requests = _serialize_requests(db, request_services.list_requests(db), viewer=user)
+
+    query_params = request.query_params
+    topic_filters = _normalize_filter_values(query_params.getlist("topic"))
+    urgency_filters = _normalize_filter_values(query_params.getlist("urgency"))
+    status_filters = _normalize_filter_values(query_params.getlist("status"))
+    all_query_items = list(query_params.multi_items()) if hasattr(query_params, "multi_items") else list(query_params.items())
+
+    request_objects = request_services.list_requests(db)
+    enriched_requests: list[tuple[HelpRequest, set[str], str]] = []
+    topic_counts: Counter[str] = Counter()
+    urgency_counts: Counter[str] = Counter()
+    status_counts: Counter[str] = Counter()
+
+    for help_request in request_objects:
+        topics = _infer_request_topics(help_request)
+        urgency = _infer_request_urgency(help_request)
+        for slug in topics:
+            topic_counts[slug] += 1
+        urgency_counts[urgency] += 1
+        status_counts[help_request.status] += 1
+        enriched_requests.append((help_request, topics, urgency))
+
+    filtered_objects = [
+        help_request
+        for help_request, topics, urgency in enriched_requests
+        if _matches_request_filters(topics, urgency, help_request.status, topic_filters, urgency_filters, status_filters)
+    ]
+
+    public_requests = _serialize_requests(db, filtered_objects, viewer=user)
+
+    filter_options = {
+        "topics": [],
+        "urgency": [],
+        "status": [],
+    }
+    base_path = request.url.path
+    for topic in FILTER_TOPICS:
+        slug = topic["slug"]
+        active = slug in topic_filters
+        url = _build_filter_url(base_path, all_query_items, "topic", slug, active)
+        filter_options["topics"].append(
+            {
+                "slug": slug,
+                "label": topic["label"],
+                "active": active,
+                "count": topic_counts.get(slug, 0),
+                "url": url,
+            }
+        )
+    for level in URGENCY_LEVELS:
+        slug = level["slug"]
+        active = slug in urgency_filters
+        url = _build_filter_url(base_path, all_query_items, "urgency", slug, active)
+        filter_options["urgency"].append(
+            {
+                "slug": slug,
+                "label": level["label"],
+                "active": active,
+                "count": urgency_counts.get(slug, 0),
+                "url": url,
+            }
+        )
+    for status_option in STATUS_OPTIONS:
+        slug = status_option["slug"]
+        active = slug in status_filters
+        url = _build_filter_url(base_path, all_query_items, "status", slug, active)
+        filter_options["status"].append(
+            {
+                "slug": slug,
+                "label": status_option["label"],
+                "active": active,
+                "count": status_counts.get(slug, 0),
+                "url": url,
+            }
+        )
+
+    reset_url = _build_reset_url(base_path, all_query_items)
     return templates.TemplateResponse(
         "requests/index.html",
         {
@@ -208,8 +499,146 @@ def home(
             "session_role": session_role,
             "session_username": user.username,
             "session_avatar_url": session_avatar_url,
+            "filter_options": filter_options,
+            "active_filters": {
+                "topics": sorted(topic_filters),
+                "urgency": sorted(urgency_filters),
+                "status": sorted(status_filters),
+            },
+            "filter_reset_url": reset_url,
         },
     )
+
+
+@router.get("/browse")
+def browse_content(
+    request: Request,
+    db: SessionDep,
+    session_user: SessionUser = Depends(require_session_user),
+    page: int = Query(1, ge=1),
+    q: Optional[str] = Query(None),
+    content_type: Optional[str] = Query("all", alias="type"),
+    status: Optional[list[str]] = Query(None),
+    tag: Optional[list[str]] = Query(None),
+) -> Response:
+    viewer = session_user.user
+    session_record = session_user.session
+    session_role = describe_session_role(viewer, session_record)
+
+    search_query = _normalize_search_term(q)
+    active_tab = _sanitize_browse_tab(content_type)
+
+    status_filters = {value for value in _normalize_filter_values(status or []) if value in STATUS_LOOKUP}
+    tag_filters = {value for value in _normalize_filter_values(tag or []) if value in FILTER_TOPICS_LOOKUP}
+
+    totals = {
+        "requests": _count_requests(db, query_text=search_query, status_filters=status_filters, tag_filters=tag_filters),
+        "comments": _count_comments(db, query_text=search_query, status_filters=status_filters, tag_filters=tag_filters),
+        "profiles": _count_profiles(db, viewer=viewer, query_text=search_query),
+    }
+    totals["all"] = totals["requests"] + totals["comments"] + totals["profiles"]
+
+    combined_page: Optional[dict[str, object]] = None
+    requests_page: Optional[dict[str, object]] = None
+    comments_page: Optional[dict[str, object]] = None
+    profiles_page: Optional[dict[str, object]] = None
+
+    if active_tab == "requests":
+        requests_page = _fetch_request_page(
+            db,
+            viewer,
+            page=page,
+            page_size=BROWSE_PAGE_SIZE,
+            query_text=search_query,
+            status_filters=status_filters,
+            tag_filters=tag_filters,
+        )
+        pagination = _build_pagination_metadata(request, requests_page["page"], requests_page["total_pages"])
+    elif active_tab == "comments":
+        comments_page = _fetch_comment_page(
+            db,
+            viewer,
+            page=page,
+            page_size=BROWSE_PAGE_SIZE,
+            query_text=search_query,
+            status_filters=status_filters,
+            tag_filters=tag_filters,
+        )
+        pagination = _build_pagination_metadata(request, comments_page["page"], comments_page["total_pages"])
+    elif active_tab == "profiles":
+        profiles_page = _fetch_profile_page(
+            db,
+            viewer,
+            page=page,
+            page_size=BROWSE_PAGE_SIZE,
+            query_text=search_query,
+        )
+        pagination = _build_pagination_metadata(request, profiles_page["page"], profiles_page["total_pages"])
+    else:
+        combined_page = _fetch_combined_feed(
+            db,
+            viewer,
+            page=page,
+            page_size=BROWSE_PAGE_SIZE,
+            query_text=search_query,
+            status_filters=status_filters,
+            tag_filters=tag_filters,
+            totals=totals,
+        )
+        pagination = _build_pagination_metadata(request, combined_page["page"], combined_page["total_pages"])
+
+    status_options = [
+        {
+            "slug": option["slug"],
+            "label": option["label"],
+            "active": option["slug"] in status_filters,
+        }
+        for option in STATUS_OPTIONS
+    ]
+    tag_options = [
+        {
+            "slug": topic["slug"],
+            "label": topic["label"],
+            "active": topic["slug"] in tag_filters,
+        }
+        for topic in FILTER_TOPICS
+    ]
+
+    tabs = _build_browse_tabs(request, totals, active_tab)
+    has_filters = bool(search_query or status_filters or tag_filters)
+
+    reset_items: list[tuple[str, str]] = []
+    if active_tab != "all":
+        reset_items.append(("type", active_tab))
+    reset_query = urlencode(reset_items, doseq=True)
+    clear_filters_url = f"{request.url.path}?{reset_query}" if reset_items else request.url.path
+
+    context = {
+        "request": request,
+        "user": viewer,
+        "session": session_record,
+        "session_role": session_role,
+        "session_username": viewer.username,
+        "session_avatar_url": session_user.avatar_url,
+        "active_tab": active_tab,
+        "tabs": tabs,
+        "status_options": status_options,
+        "tag_options": tag_options,
+        "search_query": search_query or "",
+        "status_filters": sorted(status_filters),
+        "tag_filters": sorted(tag_filters),
+        "has_filters": has_filters,
+        "combined_page": combined_page,
+        "requests_page": requests_page,
+        "comments_page": comments_page,
+        "profiles_page": profiles_page,
+        "pagination": pagination,
+        "topic_lookup": FILTER_TOPICS_LOOKUP,
+        "filter_reset_url": clear_filters_url,
+        "totals": totals,
+        "viewer_is_admin": viewer.is_admin,
+    }
+    return templates.TemplateResponse("browse/index.html", context)
 
 
 @router.get("/requests/{request_id}")
@@ -290,6 +719,62 @@ def request_chat_search(
         "display_names": {str(user_id): name for user_id, name in display_names.items()},
     }
     return JSONResponse(payload)
+
+
+@router.get("/comments/{comment_id}")
+def comment_detail(
+    request: Request,
+    comment_id: int,
+    db: SessionDep,
+    session_user: SessionUser = Depends(require_session_user),
+) -> Response:
+    viewer = session_user.user
+    session_record = session_user.session
+    session_role = describe_session_role(viewer, session_record)
+
+    comment = db.get(RequestComment, comment_id)
+    if not comment or comment.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
+
+    help_request = db.get(HelpRequest, comment.help_request_id)
+    if not help_request:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
+
+    if help_request.status == "pending" and not (
+        viewer.is_admin or help_request.created_by_user_id == viewer.id
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
+
+    author = db.get(User, comment.user_id)
+    if not author:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
+
+    attr_key = _signal_display_attr_key(help_request)
+    display_name_map = _load_signal_display_names_for_user_ids(db, {author.id}, attr_key)
+    display_name = display_name_map.get(author.id)
+
+    serialized_comment = request_comment_service.serialize_comment(
+        comment,
+        author,
+        display_name=display_name,
+    )
+
+    serialized_request = _serialize_requests(db, [help_request], viewer=viewer)
+    request_payload = serialized_request[0] if serialized_request else None
+
+    context = {
+        "request": request,
+        "user": viewer,
+        "session": session_record,
+        "session_role": session_role,
+        "session_username": viewer.username,
+        "session_avatar_url": session_user.avatar_url,
+        "comment": serialized_comment,
+        "comment_author": author,
+        "comment_display_name": display_name,
+        "request_summary": request_payload,
+    }
+    return templates.TemplateResponse("comments/detail.html", context)
 
 
 @router.post("/requests/{request_id}/comments")
@@ -507,9 +992,37 @@ def _build_request_detail_context(
         )
         for comment, author in comment_rows
     ]
+    comment_promotions = comment_request_promotion_service.get_promotions_for_comment_ids(
+        db, [item["id"] for item in comments]
+    )
     settings = config.get_settings()
     show_comment_insights = settings.comment_insights_indicator_enabled and viewer.is_admin
     comment_insights_map: dict[int, dict[str, object]] = {}
+    promoted_comment_context: Optional[dict[str, object]] = None
+    promotion = db.exec(
+        select(CommentPromotion).where(CommentPromotion.request_id == help_request.id)
+    ).first()
+    if promotion:
+        source_comment = db.get(RequestComment, promotion.comment_id)
+        if source_comment:
+            source_author = db.get(User, source_comment.user_id)
+            if source_author:
+                insight = comment_llm_insights_service.get_analysis_by_comment_id(source_comment.id)
+                display_name_map = _load_signal_display_names_for_user_ids(
+                    db,
+                    {source_author.id},
+                    attr_key,
+                )
+                promoted_comment_context = {
+                    "comment": request_comment_service.serialize_comment(
+                        source_comment,
+                        source_author,
+                        display_name=display_name_map.get(source_author.id),
+                    ),
+                    "insight": insight,
+                    "promotion": promotion,
+                }
+
     if show_comment_insights:
         for item in comments:
             analysis = comment_llm_insights_service.get_analysis_by_comment_id(item["id"])
@@ -555,6 +1068,8 @@ def _build_request_detail_context(
         "total_pages": total_pages,
         "total_comments": total_comments,
     }
+
+    show_chat_search_panel = total_comments >= CHAT_SEARCH_MIN_COMMENTS
 
     chat_filters = chat_search_filters or {}
     chat_query = str(chat_filters.get("query", "") or "").strip()
@@ -603,6 +1118,7 @@ def _build_request_detail_context(
         "session_avatar_url": session_user.avatar_url,
         "comments": comments,
         "can_comment": session_record.is_fully_authenticated,
+        "can_promote_comments": session_record.is_fully_authenticated,
         "can_moderate_comments": can_moderate,
         "can_toggle_sync_scope": can_toggle_sync_scope,
         "comment_form_errors": comment_form_errors or [],
@@ -610,7 +1126,9 @@ def _build_request_detail_context(
         "comment_max_length": request_comment_service.MAX_COMMENT_LENGTH,
         "request_id": help_request.id,
         "comment_display_names": display_names,
+        "comment_promotions": comment_promotions,
         "pagination": pagination,
+        "show_chat_search_panel": show_chat_search_panel,
         "chat_search": {
             "query": chat_query,
             "participants": participant_filters,
@@ -622,6 +1140,7 @@ def _build_request_detail_context(
         "related_chat_suggestions": related_chats,
         "comment_insights_enabled": show_comment_insights,
         "comment_insights_map": comment_insights_map,
+        "promoted_comment_context": promoted_comment_context,
     }
 
 
@@ -1057,7 +1576,7 @@ def profile_comments(
                 "created_at": comment.created_at,
                 "created_at_iso": created_at_iso,
                 "scope": (comment.sync_scope or "private").title(),
-                "comment_url": f"{group_url}#comment-{comment.id}",
+                "comment_url": f"/comments/{comment.id}",
                 "username": person.username,
                 "display_name": person.username,
             }
@@ -1125,6 +1644,425 @@ def complete_request(
 ):
     request_services.mark_completed(db, request_id=request_id, user=user)
     return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _build_request_browse_conditions(
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+) -> list:
+    conditions = [HelpRequest.status != "pending"]
+    if query_text:
+        pattern = f"%{query_text}%"
+        conditions.append(
+            or_(
+                HelpRequest.description.ilike(pattern),
+                HelpRequest.title.ilike(pattern),
+            )
+        )
+    if status_filters:
+        conditions.append(HelpRequest.status.in_(list(status_filters)))
+    topic_clause = _topic_keyword_clause([HelpRequest.description], tag_filters)
+    if topic_clause is not None:
+        conditions.append(topic_clause)
+    return conditions
+
+
+def _build_comment_browse_conditions(
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+) -> list:
+    conditions = [
+        RequestComment.deleted_at.is_(None),
+        HelpRequest.status != "pending",
+    ]
+    if query_text:
+        pattern = f"%{query_text}%"
+        conditions.append(
+            or_(
+                RequestComment.body.ilike(pattern),
+                HelpRequest.description.ilike(pattern),
+                HelpRequest.title.ilike(pattern),
+            )
+        )
+    if status_filters:
+        conditions.append(HelpRequest.status.in_(list(status_filters)))
+    topic_clause = _topic_keyword_clause([RequestComment.body, HelpRequest.description], tag_filters)
+    if topic_clause is not None:
+        conditions.append(topic_clause)
+    return conditions
+
+
+def _build_profile_browse_conditions(
+    db: Session,
+    viewer: User,
+    query_text: Optional[str],
+) -> list:
+    conditions: list = []
+    visibility_clause = _profile_visibility_clause(db, viewer)
+    if visibility_clause is not None:
+        conditions.append(visibility_clause)
+    if query_text:
+        pattern = f"%{query_text}%"
+        conditions.append(
+            or_(
+                User.username.ilike(pattern),
+                User.contact_email.ilike(pattern),
+            )
+        )
+    return conditions
+
+
+def _count_requests(
+    db: Session,
+    *,
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+) -> int:
+    conditions = _build_request_browse_conditions(query_text, status_filters, tag_filters)
+    stmt = select(func.count()).select_from(HelpRequest).where(*conditions)
+    return int(db.exec(stmt).one() or 0)
+
+
+def _count_comments(
+    db: Session,
+    *,
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+) -> int:
+    conditions = _build_comment_browse_conditions(query_text, status_filters, tag_filters)
+    stmt = (
+        select(func.count())
+        .select_from(RequestComment)
+        .join(HelpRequest, HelpRequest.id == RequestComment.help_request_id)
+        .where(*conditions)
+    )
+    return int(db.exec(stmt).one() or 0)
+
+
+def _count_profiles(
+    db: Session,
+    *,
+    viewer: User,
+    query_text: Optional[str],
+) -> int:
+    conditions = _build_profile_browse_conditions(db, viewer, query_text)
+    stmt = select(func.count()).select_from(User).where(*conditions)
+    return int(db.exec(stmt).one() or 0)
+
+
+def _fetch_request_page(
+    db: Session,
+    viewer: User,
+    *,
+    page: int,
+    page_size: int,
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+) -> dict[str, object]:
+    total = _count_requests(db, query_text=query_text, status_filters=status_filters, tag_filters=tag_filters)
+    if not total:
+        return {"items": [], "page": 1, "total_pages": 1, "total": 0, "topics": {}}
+
+    total_pages = max(1, math.ceil(total / page_size))
+    current_page = min(max(1, page), total_pages)
+    offset = (current_page - 1) * page_size
+    stmt = (
+        select(HelpRequest)
+        .where(*_build_request_browse_conditions(query_text, status_filters, tag_filters))
+        .order_by(HelpRequest.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    rows = db.exec(stmt).all()
+    serialized = _serialize_requests(db, rows, viewer=viewer)
+    topics_map = {row.id: sorted(_infer_request_topics(row)) for row in rows}
+    return {
+        "items": serialized,
+        "page": current_page,
+        "total_pages": total_pages,
+        "total": total,
+        "topics": topics_map,
+    }
+
+
+def _fetch_comment_page(
+    db: Session,
+    viewer: User,
+    *,
+    page: int,
+    page_size: int,
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+) -> dict[str, object]:
+    total = _count_comments(db, query_text=query_text, status_filters=status_filters, tag_filters=tag_filters)
+    if not total:
+        return {"items": [], "page": 1, "total_pages": 1, "total": 0}
+
+    total_pages = max(1, math.ceil(total / page_size))
+    current_page = min(max(1, page), total_pages)
+    offset = (current_page - 1) * page_size
+    stmt = (
+        select(RequestComment, User, HelpRequest)
+        .join(User, User.id == RequestComment.user_id)
+        .join(HelpRequest, HelpRequest.id == RequestComment.help_request_id)
+        .where(*_build_comment_browse_conditions(query_text, status_filters, tag_filters))
+        .order_by(RequestComment.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    rows = db.exec(stmt).all()
+    entries = []
+    for comment, author, help_request in rows:
+        payload = request_comment_service.serialize_comment(comment, author)
+        entries.append(
+            {
+                "comment": payload,
+                "request": {
+                    "id": help_request.id,
+                    "title": help_request.title or "Untitled request",
+                    "status": help_request.status,
+                },
+            }
+        )
+    return {
+        "items": entries,
+        "page": current_page,
+        "total_pages": total_pages,
+        "total": total,
+    }
+
+
+def _fetch_profile_page(
+    db: Session,
+    viewer: User,
+    *,
+    page: int,
+    page_size: int,
+    query_text: Optional[str],
+) -> dict[str, object]:
+    total = _count_profiles(db, viewer=viewer, query_text=query_text)
+    if not total:
+        return {
+            "items": [],
+            "page": 1,
+            "total_pages": 1,
+            "total": 0,
+            "avatars": {},
+        }
+
+    total_pages = max(1, math.ceil(total / page_size))
+    current_page = min(max(1, page), total_pages)
+    offset = (current_page - 1) * page_size
+    stmt = (
+        select(User)
+        .where(*_build_profile_browse_conditions(db, viewer, query_text))
+        .order_by(User.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    rows = db.exec(stmt).all()
+    avatar_urls = user_attribute_service.load_profile_photo_urls(
+        db,
+        user_ids=[user.id for user in rows if user.id],
+    )
+    return {
+        "items": rows,
+        "page": current_page,
+        "total_pages": total_pages,
+        "total": total,
+        "avatars": avatar_urls,
+    }
+
+
+def _load_requests_by_ids(db: Session, viewer: User, request_ids: list[int]) -> dict[int, dict[str, object]]:
+    if not request_ids:
+        return {}
+    stmt = select(HelpRequest).where(HelpRequest.id.in_(request_ids))
+    rows = db.exec(stmt).all()
+    serialized = _serialize_requests(db, rows, viewer=viewer)
+    topics_map = {row.id: sorted(_infer_request_topics(row)) for row in rows}
+    return {
+        item["id"]: {
+            "data": item,
+            "topics": topics_map.get(item["id"], []),
+        }
+        for item in serialized
+    }
+
+
+def _load_comments_by_ids(db: Session, comment_ids: list[int]) -> dict[int, dict[str, object]]:
+    if not comment_ids:
+        return {}
+    stmt = (
+        select(RequestComment, User, HelpRequest)
+        .join(User, User.id == RequestComment.user_id)
+        .join(HelpRequest, HelpRequest.id == RequestComment.help_request_id)
+        .where(RequestComment.id.in_(comment_ids))
+    )
+    rows = db.exec(stmt).all()
+    lookup: dict[int, dict[str, object]] = {}
+    for comment, author, help_request in rows:
+        payload = request_comment_service.serialize_comment(comment, author)
+        lookup[comment.id] = {
+            "comment": payload,
+            "request": {
+                "id": help_request.id,
+                "title": help_request.title or "Untitled request",
+                "status": help_request.status,
+            },
+        }
+    return lookup
+
+
+def _load_profiles_by_ids(db: Session, viewer: User, profile_ids: list[int]) -> dict[int, dict[str, object]]:
+    if not profile_ids:
+        return {}
+    stmt = select(User).where(User.id.in_(profile_ids))
+    rows = db.exec(stmt).all()
+    avatar_urls = user_attribute_service.load_profile_photo_urls(
+        db,
+        user_ids=[user.id for user in rows if user.id],
+    )
+    return {
+        user.id: {
+            "user": user,
+            "avatar_url": avatar_urls.get(user.id),
+        }
+        for user in rows
+        if user.id is not None
+    }
+
+
+def _fetch_combined_feed(
+    db: Session,
+    viewer: User,
+    *,
+    page: int,
+    page_size: int,
+    query_text: Optional[str],
+    status_filters: set[str],
+    tag_filters: set[str],
+    totals: dict[str, int],
+) -> dict[str, object]:
+    total = totals.get("all", 0)
+    if not total:
+        return {"items": [], "page": 1, "total_pages": 1, "total": 0}
+
+    total_pages = max(1, math.ceil(total / page_size))
+    current_page = min(max(1, page), total_pages)
+    offset = (current_page - 1) * page_size
+
+    request_select = (
+        select(
+            literal("request").label("kind"),
+            HelpRequest.id.label("entity_id"),
+            HelpRequest.created_at.label("created_at"),
+        )
+        .where(*_build_request_browse_conditions(query_text, status_filters, tag_filters))
+    )
+    comment_select = (
+        select(
+            literal("comment").label("kind"),
+            RequestComment.id.label("entity_id"),
+            RequestComment.created_at.label("created_at"),
+        )
+        .select_from(RequestComment)
+        .join(HelpRequest, HelpRequest.id == RequestComment.help_request_id)
+        .where(*_build_comment_browse_conditions(query_text, status_filters, tag_filters))
+    )
+    profile_select = (
+        select(
+            literal("profile").label("kind"),
+            User.id.label("entity_id"),
+            User.created_at.label("created_at"),
+        )
+        .where(*_build_profile_browse_conditions(db, viewer, query_text))
+    )
+
+    combined_source = union_all(request_select, comment_select, profile_select).subquery()
+    stmt = (
+        select(
+            combined_source.c.kind,
+            combined_source.c.entity_id,
+            combined_source.c.created_at,
+        )
+        .order_by(desc(combined_source.c.created_at))
+        .offset(offset)
+        .limit(page_size)
+    )
+    rows = db.exec(stmt).all()
+
+    request_ids = [row.entity_id for row in rows if row.kind == "request"]
+    comment_ids = [row.entity_id for row in rows if row.kind == "comment"]
+    profile_ids = [row.entity_id for row in rows if row.kind == "profile"]
+
+    request_lookup = _load_requests_by_ids(db, viewer, request_ids)
+    comment_lookup = _load_comments_by_ids(db, comment_ids)
+    profile_lookup = _load_profiles_by_ids(db, viewer, profile_ids)
+
+    entries: list[dict[str, object]] = []
+    for row in rows:
+        if row.kind == "request":
+            payload = request_lookup.get(row.entity_id)
+            if not payload:
+                continue
+            entries.append(
+                {
+                    "kind": "request",
+                    "data": payload["data"],
+                    "created_at": row.created_at,
+                    "topics": payload["topics"],
+                    "href": f"/requests/{payload['data']['id']}",
+                    "snippet": _truncate_text(str(payload["data"].get("description") or "")),
+                }
+            )
+        elif row.kind == "comment":
+            payload = comment_lookup.get(row.entity_id)
+            if not payload:
+                continue
+            entries.append(
+                {
+                    "kind": "comment",
+                    "data": payload["comment"],
+                    "created_at": row.created_at,
+                    "request": payload["request"],
+                    "href": f"/comments/{payload['comment']['id']}",
+                    "snippet": _truncate_text(str(payload["comment"].get("body") or "")),
+                }
+            )
+        elif row.kind == "profile":
+            payload = profile_lookup.get(row.entity_id)
+            if not payload:
+                continue
+            profile_user = payload["user"]
+            if viewer.is_admin:
+                profile_href = f"/admin/profiles/{profile_user.id}"
+            elif profile_user.id == viewer.id:
+                profile_href = "/profile"
+            else:
+                profile_href = f"/people/{profile_user.username}"
+            entries.append(
+                {
+                    "kind": "profile",
+                    "user": payload["user"],
+                    "avatar_url": payload["avatar_url"],
+                    "created_at": row.created_at,
+                    "href": profile_href,
+                }
+            )
+
+    return {
+        "items": entries,
+        "page": current_page,
+        "total_pages": total_pages,
+        "total": total,
+    }
 
 
 def _get_account_avatar(db: Session, user_id: int) -> Optional[str]:

@@ -9,7 +9,11 @@
 {% block content %}
 {% set readonly = readonly if readonly is defined else False %}
 {% set session = session if session is defined else None %}
-<section class="section">
+<section class="section request-list-layout">
+  <div class="request-list__filter">
+    {% include "requests/partials/filter_bar.html" %}
+  </div>
+  <div class="request-list__content">
   <div
     class="card stack requests-hero is-collapsed"
     id="request-form-card"
@@ -64,6 +68,7 @@
 
   <div id="request-list" data-request-list data-readonly="{{ 'true' if readonly else 'false' }}">
     {% include "requests/partials/list.html" %}
+  </div>
   </div>
 </section>
 {% endblock %}

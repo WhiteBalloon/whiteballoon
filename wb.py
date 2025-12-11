@@ -60,6 +60,8 @@ CHAT_EMBED_MODULE = "app.tools.request_chat_embeddings"
 COMMENT_LLM_MODULE = "app.tools.comment_llm_processing"
 SIGNAL_PROFILE_MODULE = "app.tools.signal_profile_snapshot_cli"
 PROFILE_GLAZE_MODULE = "app.tools.profile_glaze_cli"
+COMMENT_PROMOTION_MODULE = "app.tools.comment_promotion_cli"
+COMMENT_PROMOTION_BATCH_MODULE = "app.tools.comment_promotion_batch"
 
 
 def python_in_venv() -> Path:
@@ -410,6 +412,33 @@ def cmd_comment_llm(args: list[str]) -> int:
     return _run_process(cmd)
 
 
+def cmd_promote_comment(args: list[str]) -> int:
+    vpy = python_in_venv()
+    if not vpy.exists():
+        warn("Virtualenv missing. Run './wb setup' first.")
+        return 1
+    if not ensure_cli_ready(vpy):
+        warn("Dependencies missing. Run './wb setup' first.")
+        return 1
+
+    cmd = [str(vpy), "-m", COMMENT_PROMOTION_MODULE, *args]
+    info("Promoting comment via CLI helper")
+    return _run_process(cmd)
+
+
+def cmd_promote_comment_batch(args: list[str]) -> int:
+    vpy = python_in_venv()
+    if not vpy.exists():
+        warn("Virtualenv missing. Run './wb setup' first.")
+        return 1
+    if not ensure_cli_ready(vpy):
+        warn("Dependencies missing. Run './wb setup' first.")
+        return 1
+    cmd = [str(vpy), "-m", COMMENT_PROMOTION_BATCH_MODULE, *args]
+    info("Running comment promotion queue worker")
+    return _run_process(cmd)
+
+
 def cmd_dedalus(args: list[str]) -> int:
     if not args or args[0] in {"-h", "--help", "help"}:
         print("Usage: wb dedalus <subcommand> [options]")
@@ -637,6 +666,8 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("chat-index")
     subparsers.add_parser("chat-embed")
     subparsers.add_parser("comment-llm")
+    subparsers.add_parser("promote-comment")
+    subparsers.add_parser("promote-comment-batch")
     subparsers.add_parser("profile-glaze")
     subparsers.add_parser("sync")
     subparsers.add_parser("skins")
@@ -679,6 +710,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_chat_embed(passthrough)
     if ns.command == "comment-llm":
         return cmd_comment_llm(passthrough)
+    if ns.command == "promote-comment":
+        return cmd_promote_comment(passthrough)
+    if ns.command == "promote-comment-batch":
+        return cmd_promote_comment_batch(passthrough)
     if ns.command == "profile-glaze":
         return cmd_profile_glaze(passthrough)
 

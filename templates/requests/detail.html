@@ -73,13 +73,80 @@
   </div>
 </section>
 
+{% if promoted_comment_context %}
+<section class="section promoted-comment-section">
+  <article class="card stack promoted-comment-card">
+    <header class="stack promoted-comment-card__header">
+      <div>
+        <p class="muted small-text">Derived from comment</p>
+        <h2>Original comment #{{ promoted_comment_context.comment.id }}</h2>
+      </div>
+      <a class="button button--ghost" href="/comments/{{ promoted_comment_context.comment.id }}">View comment</a>
+    </header>
+    <div class="promoted-comment-card__body">
+      <p class="muted small-text">
+        Posted by @{{ promoted_comment_context.comment.username }} ·
+        <time datetime="{{ promoted_comment_context.comment.created_at_iso }}">{{ promoted_comment_context.comment.created_at | friendly_time }}</time>
+      </p>
+      <p>{{ promoted_comment_context.comment.body }}</p>
+    </div>
+    {% if promoted_comment_context.insight %}
+      <div class="promoted-comment-card__insight">
+        {% if promoted_comment_context.insight.summary %}
+          <p class="promoted-comment-card__summary">{{ promoted_comment_context.insight.summary }}</p>
+        {% endif %}
+        <div class="promoted-comment-card__tags">
+          {% if promoted_comment_context.insight.resource_tags %}
+            <div class="promoted-comment-card__tag-group">
+              <span class="muted small-text">Resource tags</span>
+              <div class="promoted-comment-card__chips">
+                {% for tag in promoted_comment_context.insight.resource_tags %}
+                  <span class="meta-chip meta-chip--small">{{ tag }}</span>
+                {% endfor %}
+              </div>
+            </div>
+          {% endif %}
+          {% if promoted_comment_context.insight.request_tags %}
+            <div class="promoted-comment-card__tag-group">
+              <span class="muted small-text">Request tags</span>
+              <div class="promoted-comment-card__chips">
+                {% for tag in promoted_comment_context.insight.request_tags %}
+                  <span class="meta-chip meta-chip--small meta-chip--ghost">{{ tag }}</span>
+                {% endfor %}
+              </div>
+            </div>
+          {% endif %}
+          {% if promoted_comment_context.insight.urgency %}
+            <span class="meta-chip meta-chip--status">Urgency · {{ promoted_comment_context.insight.urgency | title }}</span>
+          {% endif %}
+          {% if promoted_comment_context.insight.sentiment %}
+            <span class="meta-chip">Sentiment · {{ promoted_comment_context.insight.sentiment | title }}</span>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+  </article>
+</section>
+{% endif %}
+
 <section class="section request-comments-section">
   <div class="card stack request-comments" data-comment-section>
+    {% if show_chat_search_panel %}
     <div class="request-chat-search" data-chat-search data-request-id="{{ request_id }}">
       <div class="request-chat-search__header stack">
-        <h2 class="h5">Search chat</h2>
+        <div class="request-chat-search__header-row">
+          <h2 class="h5">Search chat</h2>
+          <button
+            type="button"
+            class="button button--ghost button--small"
+            data-chat-search-toggle
+            aria-expanded="false"
+            aria-controls="chat-search-panel"
+          >Show</button>
+        </div>
         <p class="muted small-text">Find specific promises, contacts, or logistics inside this chat.</p>
       </div>
+      <div class="request-chat-search__body" id="chat-search-panel" data-chat-search-panel hidden>
       <form class="request-chat-search__form" method="get" action="{{ request.url.path }}" data-chat-search-form>
         <input type="hidden" name="page" value="{{ pagination.current_page }}" />
         <label class="request-chat-search__label">
@@ -109,7 +176,7 @@
               'display_name': match.display_name or comment_display_names.get(match.user_id),
               'created_at': match.created_at,
               'created_at_iso': match.created_at,
-              'body_html': match.body,
+              'body': match.body,
               'topics': match.topics,
               'ai_topics': match.ai_topics,
               'comment_anchor': match.anchor
@@ -160,7 +227,9 @@
           </ul>
         </div>
       {% endif %}
+      </div>
     </div>
+    {% endif %}
     {% if comments %}
       <ul class="request-comments__list" data-comment-list>
         {% for comment in comments %}
@@ -219,6 +288,44 @@
     {% endif %}
   </div>
 </section>
+{% if can_promote_comments %}
+  <dialog class="request-comment__modal" data-comment-promote-modal>
+    <form class="stack" data-comment-promote-form>
+      <h2>Promote comment to request</h2>
+      <p class="small-text" data-comment-promote-context></p>
+      <div class="alert alert--warning" data-comment-promote-warning hidden>
+        <p data-comment-promote-warning-text></p>
+      </div>
+      <label class="stack">
+        <span>Summary</span>
+        <textarea rows="4" data-comment-promote-description required></textarea>
+      </label>
+      <label class="stack">
+        <span>Contact email (optional)</span>
+        <input type="email" data-comment-promote-contact />
+      </label>
+      <label class="stack">
+        <span>Status</span>
+        <select data-comment-promote-status>
+          <option value="open">Open</option>
+          <option value="pending">Pending</option>
+        </select>
+      </label>
+      <label class="stack" data-comment-promote-override-row hidden>
+        <span class="small-text">Create another request even though this comment was promoted before</span>
+        <div class="form-check">
+          <input type="checkbox" data-comment-promote-override />
+          <span>Allow duplicate promotion</span>
+        </div>
+      </label>
+      <div class="alert alert--error" data-comment-promote-error hidden></div>
+      <div class="request-comments__form-footer">
+        <button type="button" class="button button--ghost" data-comment-promote-cancel>Cancel</button>
+        <button type="submit" class="button" data-comment-promote-submit>Create request</button>
+      </div>
+  </form>
+</dialog>
+{% endif %}
 <template id="chat-search-result-template">
   <li class="request-chat-search__result" data-comment-id>
     <div class="request-chat-search__identity">
@@ -235,4 +342,7 @@
 <script src="/static/js/request-comments.js" defer></script>
 <script src="/static/js/request-chat-search.js" defer></script>
 <script src="/static/js/comment-insight-badges.js" defer></script>
+{% if can_promote_comments %}
+<script src="/static/js/comment-promotion.js" defer></script>
+{% endif %}
 {% endblock %}

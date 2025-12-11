@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}Comment #{{ comment.id }} · WhiteBalloon{% endblock %}
+
+{% block nav %}
+  {% include "partials/account_nav.html" %}
+{% endblock %}
+
+{% block content %}
+<section class="section stack" data-page="comment-detail">
+  <header class="stack comment-detail__header">
+    <p class="muted small-text">Comment permalink</p>
+    <h1>
+      Comment #{{ comment.id }}
+      {% if request_summary %}
+        <span class="muted">on Request #{{ request_summary.id }}</span>
+      {% endif %}
+    </h1>
+    {% if request_summary %}
+      <a class="button button--ghost" href="/requests/{{ request_summary.id }}">View full request</a>
+    {% endif %}
+  </header>
+
+  <div class="comment-detail__layout">
+    <article class="card stack comment-detail__comment">
+      <h2>Comment</h2>
+      {% with comment = comment, comment_permalink_href = request.url.path %}
+        {% include "partials/comment_card.html" %}
+      {% endwith %}
+    </article>
+
+    {% if request_summary %}
+      <article class="card stack comment-detail__request">
+        <h2>Request summary</h2>
+        <div class="comment-detail__request-meta">
+          <div>
+            <p class="comment-detail__request-id">Request #{{ request_summary.id }}</p>
+            <p class="muted small-text">Updated {{ request_summary.updated_at | friendly_time }}</p>
+          </div>
+          <span class="meta-chip meta-chip--status">{{ request_summary.status | title }}</span>
+        </div>
+        <p>{{ request_summary.description or 'No additional details.' }}</p>
+        <div class="comment-detail__request-actions">
+          <a class="button button--ghost" href="/requests/{{ request_summary.id }}">View full request</a>
+        </div>
+      </article>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}
